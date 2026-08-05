@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+data/
+scratch/*
+!scratch/README.md
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+service-account.json
