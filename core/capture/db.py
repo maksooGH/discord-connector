@@ -59,6 +59,24 @@ async def upsert_channel(db: aiosqlite.Connection, **kw: Any) -> None:
     """, kw)
 
 
+async def replace_channel_overwrites(db: aiosqlite.Connection, channel_id: int,
+                                     guild_id: int, entries: list[dict]) -> None:
+    """Replace every overwrite for one channel.
+
+    Delete-then-insert rather than upsert, because an overwrite being REMOVED is
+    a real change and an upsert would leave the stale row behind granting phantom
+    access. Current state only — the audit trail of who changed what lives in
+    `events`.
+    """
+    await db.execute("DELETE FROM channel_overwrites WHERE channel_id = ?", (channel_id,))
+    if entries:
+        await db.executemany("""
+            INSERT INTO channel_overwrites
+                (channel_id, guild_id, target_id, target_type, allow, deny, updated_at)
+            VALUES (:channel_id, :guild_id, :target_id, :target_type, :allow, :deny, datetime('now'))
+        """, [{"channel_id": channel_id, "guild_id": guild_id, **e} for e in entries])
+
+
 async def upsert_role(db: aiosqlite.Connection, **kw: Any) -> None:
     await db.execute("""
         INSERT INTO roles (id, guild_id, name, color, position, permissions, member_count, updated_at)
@@ -281,6 +299,24 @@ SCHEMA = """
         downloaded INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now'))
     );
+
+    -- Channel permission overwrites.
+    -- Sparse: only explicitly-set entries exist (median 7 per channel), never one
+    -- row per member. target_type is load-bearing — role ids and user ids are
+    -- both snowflakes and cannot be told apart by value.
+    -- Note the @everyone role id EQUALS the guild id.
+    CREATE TABLE IF NOT EXISTS channel_overwrites (
+        channel_id INTEGER NOT NULL,
+        guild_id INTEGER NOT NULL,
+        target_id INTEGER NOT NULL,
+        target_type TEXT NOT NULL CHECK (target_type IN ('role','member')),
+        allow INTEGER NOT NULL DEFAULT 0,
+        deny INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT,
+        PRIMARY KEY (channel_id, target_id, target_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_overwrites_guild ON channel_overwrites(guild_id);
+    CREATE INDEX IF NOT EXISTS idx_overwrites_target ON channel_overwrites(target_id);
 
     CREATE TABLE IF NOT EXISTS bot_state (
         key TEXT PRIMARY KEY,

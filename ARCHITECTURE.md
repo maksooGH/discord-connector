@@ -51,8 +51,13 @@ idempotent — it repairs holes without duplicating rows.
 | `events` | audit log + gateway events | |
 | `media` | attachment metadata | |
 | `bot_state` | last_startup, per-guild backfill markers | |
+| `channel_overwrites` | per-channel permission grants/denies | sparse — median 7 per channel, never one per member |
 
-Two schema facts that catch people out:
+Three schema facts that catch people out:
+
+- **`channel_overwrites.target_type` is load-bearing.** Role ids and user ids are
+  both snowflakes and cannot be told apart by value. And the `@everyone` role id
+  **equals the guild id**.
 
 - **`role_ids` is JSON, not CSV.** Use `query.role_ids(raw)`; splitting on commas
   silently returns nothing.
@@ -119,8 +124,16 @@ So on a server built from private per-member channels, the practical choice is:
   added to every private category, and any hand-made channel outside the ticket
   tool's template will be missed.
 
-Measured on one production server: no single staff role covered more than 76% of
-private channels. Choose accordingly.
+Two different measurements get confused here, and `core.permissions` can now tell
+them apart:
+
+- **explicit overwrites** — on one production server no staff role was listed on
+  more than 76% of the 249 private channels (`channel_overwrites` rows)
+- **resolved access** — several roles reach 100%, because they carry
+  Administrator, which bypasses overwrites entirely (`perm.role_coverage`)
+
+If you are choosing a least-privilege role for the bot, the first number is the
+one that matters: it is what a role without Administrator would actually see.
 
 ## Intents
 

@@ -12,6 +12,7 @@ import discord
 from .db import (
     get_db, upsert_guild, upsert_channel, upsert_role, upsert_member,
     upsert_message, insert_media, insert_event, get_last_message_id,
+    replace_channel_overwrites,
     set_bot_state, get_bot_state,
 )
 
@@ -43,6 +44,12 @@ async def snapshot_guild(guild: discord.Guild) -> None:
                 topic=getattr(ch, "topic", None), position=ch.position,
                 created_at=ch.created_at.isoformat(),
             )
+            await replace_channel_overwrites(db, ch.id, guild.id, [
+                {"target_id": tgt.id,
+                 "target_type": "role" if isinstance(tgt, discord.Role) else "member",
+                 "allow": ow.pair()[0].value, "deny": ow.pair()[1].value}
+                for tgt, ow in ch.overwrites.items()
+            ])
 
         # All roles
         for role in guild.roles:

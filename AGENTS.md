@@ -68,7 +68,19 @@ idx.owner_of(channel_id)
 idx.unowned()
 
 verify.audit(con).render()
+
+from core import permissions as perm
+perm.who_can_see(con, gid, channel_id)        # -> members
+perm.roles_that_can_see(con, gid, channel_id) # -> role ids
+perm.channels_visible_to(con, gid, member)    # -> channels
+perm.private_channels(con, gid)               # @everyone denied view
+perm.role_coverage(con, gid)                  # which role reaches most private channels
 ```
+
+**6. Permission answers need fresh overwrite data.** `perm.*` reads
+`channel_overwrites`, populated by `bin/snapshot.py`. Run it before any access
+question, and check `perm.has_overwrite_data()` — a guild captured before this
+table existed will resolve everything as denied.
 
 ## Style
 
