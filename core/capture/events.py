@@ -10,6 +10,7 @@ from typing import Any
 import discord
 
 from .db import (
+    replace_channel_overwrites,
     get_db, upsert_channel, upsert_role, upsert_member, upsert_message,
     insert_event, insert_media,
 )
@@ -77,6 +78,8 @@ def _member_to_dict(member: discord.Member) -> dict[str, Any]:
         bot=int(member.bot),
         joined_at=member.joined_at.isoformat() if member.joined_at else None,
         role_ids=json.dumps([r.id for r in member.roles]),
+        timed_out_until=(member.timed_out_until.isoformat()
+                         if getattr(member, "timed_out_until", None) else None),
     )
 
 
@@ -183,6 +186,28 @@ def setup_events(bot: discord.Client) -> None:
                 changes["topic"] = {"before": getattr(before, "topic", None), "after": getattr(after, "topic", None)}
             if before.position != after.position:
                 changes["position"] = {"before": before.position, "after": after.position}
+            # Overwrites change through this event too, and a permission answer is
+            # only as fresh as the last snapshot. Refresh them here so access
+            # questions stay correct between snapshots.
+            before_ow = {(t.id, t): p.pair() for t, p in before.overwrites.items()}
+            after_ow = {(t.id, t): p.pair() for t, p in after.overwrites.items()}
+            if before_ow.keys() != after_ow.keys() or any(
+                    before_ow[k] != after_ow[k] for k in before_ow.keys() & after_ow.keys()):
+                changes["overwrites"] = {
+                    "before": [{"target_id": t.id,
+                                "target_type": "role" if isinstance(t, discord.Role) else "member",
+                                "allow": p.pair()[0].value, "deny": p.pair()[1].value}
+                               for t, p in before.overwrites.items()],
+                    "after": [{"target_id": t.id,
+                               "target_type": "role" if isinstance(t, discord.Role) else "member",
+                               "allow": p.pair()[0].value, "deny": p.pair()[1].value}
+                              for t, p in after.overwrites.items()],
+                }
+                await replace_channel_overwrites(db, after.id, after.guild.id, [
+                    {"target_id": t.id,
+                     "target_type": "role" if isinstance(t, discord.Role) else "member",
+                     "allow": p.pair()[0].value, "deny": p.pair()[1].value}
+                    for t, p in after.overwrites.items()])
             await insert_event(db, after.guild.id, "channel_update", {
                 "channel_id": after.id, "changes": changes,
             })

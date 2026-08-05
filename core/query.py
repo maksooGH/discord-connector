@@ -27,19 +27,36 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-DEFAULT_DB = os.environ.get("DISCORD_DB_PATH", "./data/discord.db")
+# Absolute by default. A CWD-relative literal would make sqlite3 silently CREATE an
+# empty DB when a script runs from anywhere but the repo root, and the resulting
+# "no such table: guilds" looks like a schema bug rather than a wrong-path bug.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB = os.environ.get("DISCORD_DB_PATH", str(_REPO_ROOT / "data" / "discord.db"))
+
+# Channel types that can hold messages and be owned by a person. Categories, voice
+# and stage rows live in the same table and must be excluded from anything that
+# asks "who owns this" or "who can see this" — they are structure, not conversation.
+MESSAGEABLE = ("text", "news")
 
 
 # ---------------------------------------------------------------------------
 # connection
 # ---------------------------------------------------------------------------
 
-def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
-    """Open the capture DB read-only-ish, with dict-like rows.
+def connect(db_path: str | Path | None = None, *, require: bool = True) -> sqlite3.Connection:
+    """Open the capture DB with dict-like rows.
 
     Rows come back as sqlite3.Row so you can use both r["name"] and r[0].
+
+    `require` raises if the file does not exist, instead of letting sqlite3 create
+    an empty one and failing later with a misleading "no such table".
     """
-    con = sqlite3.connect(str(db_path or DEFAULT_DB))
+    path = Path(db_path or DEFAULT_DB)
+    if require and not path.exists():
+        raise FileNotFoundError(
+            f"no capture DB at {path}. Set DISCORD_DB_PATH, or run bin/run_bot.py "
+            f"to create one.")
+    con = sqlite3.connect(str(path))
     con.row_factory = sqlite3.Row
     return con
 
@@ -75,8 +92,13 @@ def guild_id_by_name(con: sqlite3.Connection, needle: str) -> int | None:
 
 def channels(con: sqlite3.Connection, guild_id: int, *,
              category_like: str | None = None,
-             include_deleted: bool = False) -> list[sqlite3.Row]:
-    """Channels in a guild, optionally filtered by a category name fragment.
+             include_deleted: bool = False,
+             types: Iterable[str] | None = MESSAGEABLE) -> list[sqlite3.Row]:
+    """Channels in a guild, optionally filtered by category and type.
+
+    `types` defaults to text+news. Pass None for every row including categories,
+    voice and stage — but be deliberate about it: those cannot hold messages, so
+    any ownership or "who posts here" logic will mis-handle them.
 
     Deleted channels are excluded by default but retained in the DB — their
     history survives even after the channel is gone from Discord, which is often
@@ -89,6 +111,10 @@ def channels(con: sqlite3.Connection, guild_id: int, *,
     if category_like:
         sql += " AND category_name LIKE ?"
         args.append(f"%{category_like}%")
+    if types:
+        types = list(types)
+        sql += f" AND type IN ({','.join('?' * len(types))})"
+        args.extend(types)
     return rows(con, sql + " ORDER BY position", *args)
 
 
@@ -124,7 +150,8 @@ def members(con: sqlite3.Connection, guild_id: int, *,
 
     Each dict: id, username, display_name, joined_at, left_at, bot, roles(set[str]).
     """
-    sql = """SELECT u.id, u.username, u.bot, m.display_name, m.joined_at, m.left_at, m.role_ids
+    sql = """SELECT u.id, u.username, u.bot, m.display_name, m.joined_at, m.left_at,
+                    m.role_ids, m.timed_out_until
              FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.guild_id = ?"""
     if not include_left:
         sql += " AND m.left_at IS NULL"
@@ -135,6 +162,8 @@ def members(con: sqlite3.Connection, guild_id: int, *,
         out.append({"id": r["id"], "username": r["username"], "bot": bool(r["bot"]),
                     "display_name": r["display_name"] or r["username"],
                     "joined_at": r["joined_at"], "left_at": r["left_at"],
+                    "timed_out_until": (r["timed_out_until"]
+                                        if "timed_out_until" in r.keys() else None),
                     "roles": role_ids(r["role_ids"])})
     return out
 
@@ -209,8 +238,27 @@ def conversation(con: sqlite3.Connection, channel_id: int, *,
 
 def search(con: sqlite3.Connection, needle: str, *, guild_id: int | None = None,
            since: str | None = None, limit: int = 200) -> list[sqlite3.Row]:
-    """Substring search across message content."""
+    """Substring search across message content.
+
+    Truncates at `limit`. Use search_count() first if the total matters — a
+    silently truncated result set has produced wrong conclusions before ("only
+    200 messages mention payment" when the real answer was 829).
+    """
     return messages(con, guild_id=guild_id, since=since, contains=needle, limit=limit)
+
+
+def search_count(con: sqlite3.Connection, needle: str, *, guild_id: int | None = None,
+                 since: str | None = None) -> int:
+    """Total matches for a search, ignoring any limit."""
+    sql = "SELECT COUNT(*) FROM messages WHERE lower(content) LIKE ?"
+    args: list[Any] = [f"%{needle.lower()}%"]
+    if guild_id is not None:
+        sql += " AND guild_id = ?"
+        args.append(guild_id)
+    if since:
+        sql += " AND created_at >= ?"
+        args.append(since)
+    return one(con, sql, *args) or 0
 
 
 def message_volume(con: sqlite3.Connection, guild_id: int, *,

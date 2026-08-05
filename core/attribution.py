@@ -53,6 +53,7 @@ class Index:
     owner: dict[int, int] = field(default_factory=dict)                 # channel_id -> user_id
     weak: set[int] = field(default_factory=set)        # channel ids matched by NAME only
     orphans: list[sqlite3.Row] = field(default_factory=list)            # no owner at all
+    communal: list[sqlite3.Row] = field(default_factory=list)  # too many posters to own
 
     def channels_for(self, user_id: int, *, category_like: str | None = None) -> list[sqlite3.Row]:
         """Channels belonging to a member, optionally filtered by category."""
@@ -65,10 +66,11 @@ class Index:
         return self.owner.get(channel_id)
 
     def unowned(self) -> list[sqlite3.Row]:
-        """Channels no member could be matched to.
+        """Messageable channels no member could be matched to.
 
         Worth reading after every run — an unowned channel usually means either a
         member who left, or a naming pattern the fallback does not cover.
+        Communal channels are NOT included; see `.communal`.
         """
         return self.orphans
 
@@ -81,7 +83,8 @@ def build(con: sqlite3.Connection, guild_id: int, *,
           staff_role_ids: Iterable[str] = (),
           staff_user_ids: Iterable[int] = (),
           category_like: str | None = None,
-          include_shared: bool = True) -> Index:
+          include_shared: bool = True,
+          max_owners: int = 3) -> Index:
     """Resolve channel ownership for a guild.
 
     staff_role_ids / staff_user_ids
@@ -94,6 +97,15 @@ def build(con: sqlite3.Connection, guild_id: int, *,
         partner, or two people on one deal). When True, secondary posters are
         also credited with the channel — but only if they own no channel of
         their own, so an incidental visitor never inherits someone else's.
+    max_owners
+        A channel with more distinct non-staff posters than this is treated as
+        COMMUNAL and given no owner at all. Without it, a busy public channel
+        (#general, #wins) gets assigned to whoever happens to post most, and the
+        shared-inheritance path then piles it onto anyone who owns nothing else.
+        Communal channels are listed in `.communal`, not `.unowned()`.
+
+    Only messageable channels are considered — categories, voice and stage rows
+    cannot hold messages, so including them would mark every one of them orphaned.
     """
     staff_roles = {str(r) for r in staff_role_ids}
     staff = set(staff_user_ids)
@@ -114,6 +126,9 @@ def build(con: sqlite3.Connection, guild_id: int, *,
             WHERE m.channel_id = ? AND u.bot = 0
             GROUP BY m.author_id ORDER BY n DESC""", ch["id"])
         non_staff = [r["author_id"] for r in posters if r["author_id"] not in staff]
+        if len(non_staff) > max_owners:
+            idx.communal.append(ch)      # public/shared space, nobody owns it
+            continue
         if non_staff:
             idx.owned.setdefault(non_staff[0], []).append(ch)
             idx.owner[ch["id"]] = non_staff[0]

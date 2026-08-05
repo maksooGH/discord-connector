@@ -106,6 +106,18 @@ constraint.
 **DMs are invisible.** A bot cannot read direct messages. Any decision made in a
 DM leaves no trace here. If something matters, it has to happen in a channel.
 
+**Threads are only captured live.** `guild.channels` structurally never contains
+threads, so backfill never sees them — only `on_thread_create`/`update`/`delete`
+do. Threads that existed before the bot joined, and any thread's message backlog,
+are missing. Permission resolution handles threads correctly (they inherit the
+parent's overwrites), but the messages are not there to query.
+
+**Communal channels have no owner.** `attribution.build()` treats any channel with
+more than `max_owners` distinct non-staff posters as communal rather than
+assigning it to whoever posted most. Without that, a busy public channel gets
+attributed to an individual, and the shared-channel inheritance path then piles it
+onto anyone who owns nothing else. Check `.communal` as well as `.unowned()`.
+
 ## Permissions
 
 Functionally the bot needs three: **View Channels**, **Read Message History**,

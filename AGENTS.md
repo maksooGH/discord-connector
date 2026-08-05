@@ -33,7 +33,11 @@ commas returns nothing and fails silently.
 it lives on `memberships` and differs per server. Active membership is
 `left_at IS NULL`, not an `is_active` column.
 
-**5. Check your denominator before reporting coverage.** "X of Y creators are
+**5. `q.channels()` returns text+news by default.** Categories, voice and stage
+rows live in the same table. Pass `types=None` only if you genuinely want them —
+they cannot hold messages, so ownership and "who posts here" logic breaks on them.
+
+**6. Check your denominator before reporting coverage.** "X of Y creators are
 missing" is wrong if Y counts people who are exempt. Category and role determine
 eligibility, not role alone.
 
@@ -65,7 +69,8 @@ q.amounts("owed $1,250.00")         # -> [1250.0]
 idx = attr.build(con, gid, staff_role_ids={"123"})
 idx.channels_for(user_id)
 idx.owner_of(channel_id)
-idx.unowned()
+idx.unowned()      # orphans (messageable only)
+idx.communal       # too many posters to belong to anyone
 
 verify.audit(con).render()
 
@@ -77,7 +82,7 @@ perm.private_channels(con, gid)               # @everyone denied view
 perm.role_coverage(con, gid)                  # which role reaches most private channels
 ```
 
-**6. Permission answers need fresh overwrite data.** `perm.*` reads
+**7. Permission answers need fresh overwrite data.** `perm.*` reads
 `channel_overwrites`, populated by `bin/snapshot.py`. Run it before any access
 question, and check `perm.has_overwrite_data()` — a guild captured before this
 table existed will resolve everything as denied.

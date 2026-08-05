@@ -10,3 +10,7 @@ __pycache__/
 .DS_Store
 *.log
 service-account.json
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

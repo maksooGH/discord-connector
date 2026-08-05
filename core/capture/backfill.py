@@ -12,7 +12,7 @@ import discord
 from .db import (
     get_db, upsert_guild, upsert_channel, upsert_role, upsert_member,
     upsert_message, insert_media, insert_event, get_last_message_id,
-    replace_channel_overwrites,
+    replace_channel_overwrites, upsert_user_only,
     set_bot_state, get_bot_state,
 )
 
@@ -102,6 +102,15 @@ async def backfill_channel(
             ]
             embeds = [e.to_dict() for e in message.embeds]
 
+            # Author first: backfilled history routinely contains people who have
+            # since left, and without this their messages end up with no users row
+            # (4,665 such orphans observed on one production DB).
+            await upsert_user_only(db, id=message.author.id, username=message.author.name,
+                                   discriminator=getattr(message.author, "discriminator", None),
+                                   avatar_url=(str(message.author.display_avatar.url)
+                                               if message.author.display_avatar else None),
+                                   bot=int(message.author.bot))
+
             await upsert_message(db,
                 id=message.id, guild_id=message.guild.id,
                 channel_id=message.channel.id, author_id=message.author.id,
@@ -157,6 +166,18 @@ async def backfill_audit_log(guild: discord.Guild, after_time: Optional[datetime
                 "target_type": type(entry.target).__name__ if entry.target else None,
                 "reason": entry.reason,
                 "changes": str(entry.changes) if entry.changes else None,
+                # str(entry.changes) is a repr of LIVE objects captured at fetch
+                # time, so two fetches of the same entry can disagree. Pull the
+                # overwrite bitfields out as real numbers.
+                **({"allow_before": getattr(entry.changes.before, "allow", None) and
+                                    entry.changes.before.allow.value,
+                    "deny_before": getattr(entry.changes.before, "deny", None) and
+                                   entry.changes.before.deny.value,
+                    "allow_after": getattr(entry.changes.after, "allow", None) and
+                                   entry.changes.after.allow.value,
+                    "deny_after": getattr(entry.changes.after, "deny", None) and
+                                  entry.changes.after.deny.value}
+                   if entry.changes and "overwrite" in entry.action.name else {}),
                 "created_at": entry.created_at.isoformat(),
             })
             count += 1

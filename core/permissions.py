@@ -16,7 +16,17 @@ Resolution order (https://discord.com/developers/docs/topics/permissions):
      channels no matter what server-level permissions it has
   4. apply the @everyone channel overwrite: deny first, then allow
   5. apply the member's role overwrites: accumulate ALL denies, then ALL allows
-  6. apply the member-specific overwrite last: deny then allow
+  6. apply the member-specific overwrite: deny then allow
+  7. implicit permissions: no VIEW_CHANNEL -> no channel permissions at all;
+     no SEND_MESSAGES -> lose embed/attach/tts/mention-everyone
+  8. timeout mask, conclusive and last
+
+Steps 7 and 8 are the ones a naive implementation misses, and a validation that
+only checks view_channel cannot see either of them: step 7 only ever changes
+OTHER bits, and step 8 preserves view_channel by definition. Validate across
+several permissions or the test is decorative.
+
+Threads have no overwrites of their own — they resolve against their parent.
 
 Two facts that bite:
   - the @everyone role id EQUALS the guild id
@@ -39,6 +49,23 @@ ADMINISTRATOR = 1 << 3
 MANAGE_CHANNELS = 1 << 4
 MANAGE_ROLES = 1 << 28
 
+# When a member is timed out Discord masks their permissions down to these two,
+# applied LAST and unconditionally (except for administrators / channel owners).
+# This is why a view_channel-only validation can never detect a missing timeout
+# step: view_channel is one of the two bits the mask preserves.
+TIMEOUT_MASK = VIEW_CHANNEL | READ_MESSAGE_HISTORY
+
+# Every permission that applies at channel scope. Taken from discord.py's
+# Permissions.all_channel(); if you cannot view a channel, all of these are
+# stripped regardless of what any overwrite granted.
+ALL_CHANNEL = 8555290110197585
+
+SEND_TTS = 1 << 12
+MENTION_EVERYONE = 1 << 17
+EMBED_LINKS = 1 << 14
+ATTACH_FILES = 1 << 15
+SEND_DEPENDENT = SEND_TTS | MENTION_EVERYONE | EMBED_LINKS | ATTACH_FILES
+
 BITS = {
     "view_channel": VIEW_CHANNEL,
     "send_messages": SEND_MESSAGES,
@@ -53,8 +80,21 @@ BITS = {
 # loading
 # ---------------------------------------------------------------------------
 
+THREAD_TYPES = ("public_thread", "private_thread", "news_thread")
+
+
 def overwrites(con: sqlite3.Connection, channel_id: int) -> list[sqlite3.Row]:
-    """Raw overwrite rows for a channel."""
+    """Raw overwrite rows for a channel, resolving threads to their parent.
+
+    Threads have NO overwrites of their own in Discord's model — permission checks
+    delegate entirely to the parent channel (discord.py: Thread.permissions_for
+    calls GuildChannel.permissions_for(self.parent, obj)). Reading the thread's own
+    id would find nothing and fall back to bare guild-level role permissions,
+    reporting a private channel's thread as visible to everyone.
+    """
+    row = q.rows(con, "SELECT type, category_id FROM channels WHERE id = ?", channel_id)
+    if row and row[0]["type"] in THREAD_TYPES and row[0]["category_id"]:
+        channel_id = row[0]["category_id"]   # threads store the parent channel here
     return q.rows(con, """SELECT target_id, target_type, allow, deny
                           FROM channel_overwrites WHERE channel_id = ?""", channel_id)
 
@@ -77,6 +117,7 @@ def has_overwrite_data(con: sqlite3.Connection, guild_id: int) -> bool:
 def permissions_for(con: sqlite3.Connection, guild_id: int, channel_id: int,
                     member_role_ids: Iterable[int | str], *,
                     member_id: int | None = None,
+                    timed_out: bool = False,
                     _role_perms: dict[int, int] | None = None,
                     _ows: list[sqlite3.Row] | None = None) -> int:
     """Resolved permission bitfield for a member in a channel.
@@ -123,6 +164,20 @@ def permissions_for(con: sqlite3.Connection, guild_id: int, channel_id: int,
         if mo:
             base &= ~int(mo["deny"])
             base |= int(mo["allow"])
+
+    # 7: implicit permissions. If you cannot read a channel you have NO channel
+    # permissions in it, and if you cannot send you lose the send-dependent ones.
+    # Mirrors discord.py's GuildChannel._apply_implicit_permissions. Omitting this
+    # reports send_messages=True on channels the member cannot even see — which is
+    # invisible to any validation that only checks view_channel.
+    if not base & VIEW_CHANNEL:
+        base &= ~ALL_CHANNEL
+    elif not base & SEND_MESSAGES:
+        base &= ~SEND_DEPENDENT
+
+    # 8: timeout mask, conclusive and last
+    if timed_out:
+        base &= TIMEOUT_MASK
     return base
 
 
@@ -130,9 +185,25 @@ def can(con: sqlite3.Connection, guild_id: int, channel_id: int,
         member: dict, permission: str = "view_channel") -> bool:
     """Does this member (a dict from query.members) have `permission` here?"""
     bit = BITS[permission]
-    perms = permissions_for(con, guild_id, channel_id,
-                            member["roles"], member_id=member["id"])
+    perms = permissions_for(con, guild_id, channel_id, member["roles"],
+                            member_id=member["id"],
+                            timed_out=is_timed_out(member))
     return bool(perms & bit)
+
+
+def is_timed_out(member: dict) -> bool:
+    """True if the member's timeout is still in the future."""
+    until = member.get("timed_out_until")
+    if not until:
+        return False
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(until)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt > datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +260,14 @@ def channels_visible_to(con: sqlite3.Connection, guild_id: int, member: dict, *,
 
 def private_channels(con: sqlite3.Connection, guild_id: int) -> list[sqlite3.Row]:
     """Channels where @everyone is denied View Channel."""
-    return q.rows(con, """
+    types = list(q.MESSAGEABLE)
+    return q.rows(con, f"""
         SELECT c.* FROM channels c
         JOIN channel_overwrites o
           ON o.channel_id = c.id AND o.target_id = ? AND o.target_type = 'role'
         WHERE c.guild_id = ? AND (c.deleted = 0 OR c.deleted IS NULL)
-          AND (o.deny & ?) != 0""", guild_id, guild_id, VIEW_CHANNEL)
+          AND c.type IN ({','.join('?' * len(types))})
+          AND (o.deny & ?) != 0""", guild_id, guild_id, *types, VIEW_CHANNEL)
 
 
 def role_coverage(con: sqlite3.Connection, guild_id: int) -> list[tuple[str, int, int]]:
@@ -230,6 +303,12 @@ async def validate(client, con: sqlite3.Connection, guild_id: int, *,
     member-overwrite step or the administrator short-circuit must make this fail.
 
     members_per_channel caps work on huge guilds; None checks every member.
+
+    Coverage limits, stated so nobody over-reads a green result:
+      - only text channels (guild.text_channels); category/voice/stage overwrite
+        rows exist in the DB but are not exercised here
+      - four permission bits, not all of them
+      - threads are only covered if the guild has any
     """
     guild = client.get_guild(guild_id)
     if guild is None:
@@ -247,13 +326,18 @@ async def validate(client, con: sqlite3.Connection, guild_id: int, *,
             rec = members.get(m.id)
             if rec is None:
                 continue
-            live = ch.permissions_for(m).view_channel
-            mine = bool(permissions_for(con, guild_id, ch.id, rec["roles"],
-                                        member_id=m.id, _role_perms=rp, _ows=ows) & VIEW_CHANNEL)
-            checked += 1
-            if live != mine:
-                mismatches += 1
-                if len(bad) < 12:
-                    bad.append(f"#{ch.name} / {m.name}: live={live} offline={mine}")
+            lp = ch.permissions_for(m)
+            offline = permissions_for(con, guild_id, ch.id, rec["roles"],
+                                      member_id=m.id, timed_out=is_timed_out(rec),
+                                      _role_perms=rp, _ows=ows)
+            for pname in ("view_channel", "send_messages", "read_message_history",
+                          "manage_channels"):
+                live = getattr(lp, pname)
+                mine = bool(offline & BITS[pname])
+                checked += 1
+                if live != mine:
+                    mismatches += 1
+                    if len(bad) < 12:
+                        bad.append(f"#{ch.name} / {m.name} / {pname}: live={live} offline={mine}")
     return {"checked": checked, "mismatches": mismatches,
             "channels": len(guild.text_channels), "examples": bad}

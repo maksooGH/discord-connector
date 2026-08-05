@@ -88,6 +88,22 @@ async def upsert_role(db: aiosqlite.Connection, **kw: Any) -> None:
     """, kw)
 
 
+async def upsert_user_only(db: aiosqlite.Connection, **kw: Any) -> None:
+    """Upsert global identity without touching membership.
+
+    For message authors seen in backfilled history who may have left the guild —
+    there is no membership to record, but the messages still need a users row.
+    """
+    await db.execute("""
+        INSERT INTO users (id, username, discriminator, avatar_url, bot, updated_at)
+        VALUES (:id, :username, :discriminator, :avatar_url, :bot, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET
+            username=excluded.username, updated_at=datetime('now')
+    """, {"id": kw["id"], "username": kw.get("username"),
+          "discriminator": kw.get("discriminator"),
+          "avatar_url": kw.get("avatar_url"), "bot": kw.get("bot", 0)})
+
+
 async def upsert_member(db: aiosqlite.Connection, **kw: Any) -> None:
     """Upsert a user + their membership in a single guild.
 
@@ -117,17 +133,24 @@ async def upsert_member(db: aiosqlite.Connection, **kw: Any) -> None:
     })
 
     await db.execute("""
-        INSERT INTO memberships (user_id, guild_id, display_name, joined_at, role_ids, updated_at)
-        VALUES (:user_id, :guild_id, :display_name, :joined_at, :role_ids, datetime('now'))
+        INSERT INTO memberships (user_id, guild_id, display_name, joined_at, role_ids, timed_out_until, updated_at)
+        VALUES (:user_id, :guild_id, :display_name, :joined_at, :role_ids, :timed_out_until, datetime('now'))
         ON CONFLICT(user_id, guild_id) DO UPDATE SET
             display_name=excluded.display_name,
             role_ids=excluded.role_ids,
+            timed_out_until=excluded.timed_out_until,
+            -- Clearing left_at is the fix for the rejoin bug: upsert_member is only
+            -- ever called for a member the API is currently reporting as present
+            -- (snapshot_guild iterates guild.members; on_member_join fires on join).
+            -- Without this a returning member reads as departed forever.
+            left_at=NULL,
             updated_at=datetime('now')
     """, {
         "user_id": user_id,
         "guild_id": kw["guild_id"],
         "display_name": kw.get("display_name"),
         "joined_at": kw.get("joined_at"),
+        "timed_out_until": kw.get("timed_out_until"),
         "role_ids": kw.get("role_ids"),
     })
 
@@ -252,6 +275,7 @@ SCHEMA = """
         joined_at TEXT,
         left_at TEXT,
         role_ids TEXT,
+        timed_out_until TEXT,
         updated_at TEXT DEFAULT (datetime('now')),
         PRIMARY KEY (user_id, guild_id),
         FOREIGN KEY (user_id) REFERENCES users(id),
