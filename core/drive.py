@@ -92,12 +92,232 @@ def _token_path() -> Path:
     return Path(client).with_name(".google-oauth-token.json")
 
 
+def _client_config() -> dict:
+    import json
+    client = os.environ.get(_CLIENT_ENV)
+    if not client:
+        raise RuntimeError(
+            f"{_CLIENT_ENV} is not set. Create a Desktop-app OAuth client in the "
+            "Google Cloud console, download the JSON, and point this at it.")
+    with open(client) as fh:
+        cfg = json.load(fh)
+    root = cfg.get("installed") or cfg.get("web")
+    if root is None:
+        raise RuntimeError(f"{client} is not an OAuth client file")
+    if "web" in cfg:
+        raise RuntimeError(
+            f"{client} is a WEB APPLICATION client. The loopback consent flow "
+            "needs a DESKTOP APP client — a web client rejects the random "
+            "localhost port with redirect_uri_mismatch.")
+    return root
+
+
+def consent(*, open_browser: bool = True, timeout: int = 300) -> dict:
+    """Run the loopback consent flow once and return the saved token.
+
+    Implemented directly on `google-auth` rather than pulling in
+    `google-auth-oauthlib`, which is a thin wrapper over exactly this and one
+    more dependency for anyone adopting the repo.
+
+    Uses PKCE (S256) and a `state` nonce: without state, any page the user
+    visits while the local server is up could drive a code into it.
+    """
+    import base64
+    import hashlib
+    import json
+    import secrets
+    import threading
+    import urllib.parse
+    import urllib.request
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from google.oauth2.credentials import Credentials
+
+    cfg = _client_config()
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    state = secrets.token_urlsafe(24)
+    got: dict[str, Any] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):                                # noqa: N802
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            ok = q.get("state", [None])[0] == state and "code" in q
+            if ok:
+                got["code"] = q["code"][0]
+            else:
+                got["error"] = q.get("error", ["state mismatch"])[0]
+            body = ("<h2>%s</h2><p>You can close this tab and return to the "
+                    "terminal.</p>" % ("Authorised ✓" if ok else "Failed: "
+                                       + got.get("error", ""))).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):                      # silence access logs
+            return
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    redirect = f"http://localhost:{port}"
+    url = "https://accounts.google.com/o/oauth2/auth?" + urllib.parse.urlencode({
+        "client_id": cfg["client_id"], "redirect_uri": redirect,
+        "response_type": "code", "scope": " ".join(_SCOPES_USER),
+        "access_type": "offline",      # required to be issued a refresh token
+        "prompt": "consent",           # force one even on re-authorisation
+        "state": state,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    })
+    print(f"\nApprove in the browser:\n{url}\n")
+    if open_browser:
+        webbrowser.open(url)
+    t = threading.Thread(target=srv.handle_request, daemon=True)
+    t.start()
+    t.join(timeout)
+    srv.server_close()
+    if "code" not in got:
+        raise RuntimeError(got.get("error") or
+                           f"no consent received within {timeout}s")
+
+    resp = urllib.request.urlopen(urllib.request.Request(
+        cfg["token_uri"],
+        data=urllib.parse.urlencode({
+            "code": got["code"], "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"], "redirect_uri": redirect,
+            "grant_type": "authorization_code", "code_verifier": verifier,
+        }).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"}))
+    tok = json.loads(resp.read())
+    if "refresh_token" not in tok:
+        raise RuntimeError(
+            "Google returned no refresh_token. Revoke the app at "
+            "myaccount.google.com/permissions and re-run.")
+    creds = Credentials(
+        token=tok["access_token"], refresh_token=tok["refresh_token"],
+        token_uri=cfg["token_uri"], client_id=cfg["client_id"],
+        client_secret=cfg["client_secret"],
+        scopes=tok.get("scope", " ".join(_SCOPES_USER)).split())
+    path = _token_path()
+    path.write_text(creds.to_json())
+    path.chmod(0o600)
+    return {"token_file": str(path), "scopes": creds.scopes}
+
+
+def _pending_path() -> Path:
+    return _token_path().with_name(".google-oauth-pending.json")
+
+
+def consent_begin() -> str:
+    """Start consent WITHOUT a local listener; returns the URL to approve.
+
+    For approving on a phone or another machine. The loopback redirect only
+    resolves on the host that opened the listener, so on any other device the
+    final page fails to load — but the authorization code is sitting in the
+    address bar. Copy that whole URL and pass it to `consent_finish()`.
+
+    The PKCE verifier and state nonce are parked in a 0600 file so the exchange
+    can happen in a later process. That file is single-use and is deleted by
+    `consent_finish()` whether it succeeds or fails, so a stale verifier can
+    never be replayed.
+    """
+    import base64
+    import hashlib
+    import json
+    import secrets
+    import urllib.parse
+
+    cfg = _client_config()
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    state = secrets.token_urlsafe(24)
+    # Must be a redirect URI the client accepts, and must match at exchange
+    # time. Nothing needs to be listening on it for the manual flow.
+    redirect = "http://localhost:1"
+    url = "https://accounts.google.com/o/oauth2/auth?" + urllib.parse.urlencode({
+        "client_id": cfg["client_id"], "redirect_uri": redirect,
+        "response_type": "code", "scope": " ".join(_SCOPES_USER),
+        "access_type": "offline", "prompt": "consent", "state": state,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    })
+    p = _pending_path()
+    p.write_text(json.dumps({"verifier": verifier, "state": state,
+                             "redirect": redirect}))
+    p.chmod(0o600)
+    return url
+
+
+def consent_finish(redirect_url: str) -> dict:
+    """Complete `consent_begin()` from the URL the browser was left on.
+
+    Accepts the whole redirect URL (`http://localhost:1/?state=…&code=…`) or a
+    bare code. The state nonce is checked when the full URL is supplied.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    from google.oauth2.credentials import Credentials
+
+    pending_file = _pending_path()
+    if not pending_file.exists():
+        raise RuntimeError("no consent in progress — call consent_begin() first")
+    pending = json.loads(pending_file.read_text())
+    try:
+        if "://" in redirect_url or "code=" in redirect_url:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(redirect_url).query)
+            if "error" in q:
+                raise RuntimeError(f"Google returned error={q['error'][0]}")
+            if "code" not in q:
+                raise RuntimeError("no ?code= in that URL")
+            if q.get("state", [None])[0] != pending["state"]:
+                raise RuntimeError("state mismatch — this URL is not from the "
+                                   "consent we started. Re-run consent_begin().")
+            code = q["code"][0]
+        else:
+            code = redirect_url.strip()
+
+        cfg = _client_config()
+        resp = urllib.request.urlopen(urllib.request.Request(
+            cfg["token_uri"],
+            data=urllib.parse.urlencode({
+                "code": code, "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "redirect_uri": pending["redirect"],
+                "grant_type": "authorization_code",
+                "code_verifier": pending["verifier"],
+            }).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"}))
+        tok = json.loads(resp.read())
+    finally:
+        pending_file.unlink(missing_ok=True)   # single use, success or not
+
+    if "refresh_token" not in tok:
+        raise RuntimeError(
+            "Google returned no refresh_token. Revoke the app at "
+            "myaccount.google.com/permissions and re-run consent_begin().")
+    cfg = _client_config()
+    creds = Credentials(
+        token=tok["access_token"], refresh_token=tok["refresh_token"],
+        token_uri=cfg["token_uri"], client_id=cfg["client_id"],
+        client_secret=cfg["client_secret"],
+        scopes=tok.get("scope", " ".join(_SCOPES_USER)).split())
+    path = _token_path()
+    path.write_text(creds.to_json())
+    path.chmod(0o600)
+    return {"token_file": str(path), "scopes": creds.scopes}
+
+
 def user_service(*, interactive: bool = True):
     """Drive client authenticated as the USER, scoped to `drive.file`.
 
     First call opens a browser for consent and caches the refresh token; later
     calls are silent. Pass interactive=False in unattended contexts — it will
-    raise rather than block forever waiting on a browser that nobody will see.
+    raise rather than block on a browser nobody will see.
     """
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -107,31 +327,17 @@ def user_service(*, interactive: bool = True):
     creds = None
     if token_file.exists():
         creds = Credentials.from_authorized_user_file(str(token_file), _SCOPES_USER)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        token_file.write_text(creds.to_json())
-        token_file.chmod(0o600)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            token_file.write_text(creds.to_json())
+            token_file.chmod(0o600)
     if not creds or not creds.valid:
         if not interactive:
             raise RuntimeError(
-                f"no usable Google user token at {token_file}. Run the consent "
-                "flow once from an interactive session.")
-        try:
-            from google_auth_oauthlib.flow import InstalledAppFlow
-        except ImportError as exc:                       # pragma: no cover
-            raise RuntimeError(
-                "google-auth-oauthlib is not installed — pip3 install "
-                "google-auth-oauthlib") from exc
-        client = os.environ.get(_CLIENT_ENV)
-        if not client:
-            raise RuntimeError(f"{_CLIENT_ENV} is not set")
-        flow = InstalledAppFlow.from_client_secrets_file(client, _SCOPES_USER)
-        # port=0 picks a free loopback port; Desktop clients accept any.
-        creds = flow.run_local_server(port=0, prompt="consent",
-                                      authorization_prompt_message=
-                                      "Approve in the browser window that just opened…")
-        token_file.write_text(creds.to_json())
-        token_file.chmod(0o600)
+                f"no usable Google user token at {token_file}. Run "
+                "core.drive.consent() once from an interactive session.")
+        consent()
+        creds = Credentials.from_authorized_user_file(str(token_file), _SCOPES_USER)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
