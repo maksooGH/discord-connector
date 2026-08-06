@@ -53,6 +53,12 @@ idempotent — it repairs holes without duplicating rows.
 | `bot_state` | last_startup, per-guild backfill markers | |
 | `channel_overwrites` | per-channel permission grants/denies | sparse — median 7 per channel, never one per member |
 
+External surfaces sit alongside, not inside, that boundary: `core/sheets.py`
+and `core/drive.py` talk to Google, never to Discord and never to the DB. A
+service account can read and reorganise anything shared with it but **owns no
+storage**, so uploading a file needs delegated user OAuth (`drive.file` scope).
+See docs/SETUP.md §4–5.
+
 Three schema facts that catch people out:
 
 - **`channel_overwrites.target_type` is load-bearing.** Role ids and user ids are

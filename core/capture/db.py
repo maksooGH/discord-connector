@@ -13,12 +13,22 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-DB_PATH = Path(os.environ.get("DISCORD_DB_PATH",
-                              Path(__file__).resolve().parent.parent.parent / "data" / "discord.db"))
+_DEFAULT_DB = Path(__file__).resolve().parent.parent.parent / "data" / "discord.db"
+
+
+def db_path() -> Path:
+    """Resolve the DB path at CALL time, not import time.
+
+    Module-level resolution silently ignored DISCORD_DB_PATH from .env, because
+    main.py imports this module before calling load_dotenv() — so the variable
+    was not set yet and the default won. Anyone setting it in .env would have
+    quietly written to the wrong file.
+    """
+    return Path(os.environ.get("DISCORD_DB_PATH", _DEFAULT_DB))
 
 
 async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(DB_PATH)
+    db = await aiosqlite.connect(db_path())
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
@@ -26,12 +36,13 @@ async def get_db() -> aiosqlite.Connection:
 
 
 async def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(DB_PATH)
+    p = db_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(p)
     await db.executescript(SCHEMA)
     await db.commit()
     await db.close()
-    log.info("Database initialized at %s", DB_PATH)
+    log.info("Database initialized at %s", db_path())
 
 
 # ---------------------------------------------------------------------------

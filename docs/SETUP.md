@@ -79,3 +79,50 @@ Two more traps:
   `sheets.tabs()` to get the exact string.
 - The `HYPERLINK` argument separator is **locale dependent** (`,` vs `;`). Wrong
   one renders `#ERROR!` in every cell. Check an existing formula first.
+
+## 5. Google Drive (optional)
+
+Only needed if you use `core.drive`. It needs **two** identities, because
+neither can do the whole job.
+
+### 5a. Service account — read, rename, move, organise, link
+
+Reuses the key from §4. Enable the **Google Drive API** in the same project,
+then share each folder with the service-account address as **Editor**.
+
+It can do everything to a file except create one:
+
+```
+403: Service Accounts do not have storage quota.
+     Leverage shared drives, or use OAuth delegation.
+```
+
+Folders are the exception — they are zero bytes, so `drive.ensure_folder()`
+works fine and a whole folder tree can be built this way.
+
+### 5b. User OAuth — upload
+
+Uploads land in the user's Drive, on the user's quota, owned by the user.
+
+1. **Google Auth Platform** (formerly "OAuth consent screen") → External
+2. Add scope **`https://www.googleapis.com/auth/drive.file` and nothing wider**
+3. **Publish the app.** In "Testing", Google expires refresh tokens after
+   **7 days** and the consent flow has to be repeated weekly. `drive.file` is
+   non-sensitive, so publishing needs no verification review.
+4. **Credentials → Create OAuth client ID → Desktop app** → download JSON
+5. `pip install google-auth-oauthlib`
+6. `export GOOGLE_OAUTH_CLIENT=/path/to/client.json`
+
+```python
+from core import drive
+svc = drive.user_service()          # opens a browser once, then caches
+drive.upload(svc, "form.pdf", parent_id=folder_id)
+```
+
+The token caches next to the client JSON as `.google-oauth-token.json`, chmod
+600. It is as sensitive as a password — never commit it.
+
+**`drive.file` is per-file, not per-Drive.** It grants access only to files the
+app itself created. That is what makes it safe, and it is also why it cannot
+see files a human uploaded by hand — reach those with the service account
+(§5a) instead. Revoke any time at myaccount.google.com/permissions.

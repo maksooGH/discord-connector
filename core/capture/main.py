@@ -12,11 +12,12 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
-from .db import init_db, get_db, set_bot_state, get_bot_state
-from .events import setup_events
-from .backfill import run_recovery, run_full_backfill, snapshot_guild
-
+# .env must load before anything reads os.environ at import time.
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
+from .db import init_db, get_db, set_bot_state, get_bot_state  # noqa: E402
+from .events import setup_events  # noqa: E402
+from .backfill import run_recovery, run_full_backfill, snapshot_guild  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
